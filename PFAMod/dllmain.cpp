@@ -1,8 +1,54 @@
 #include <windows.h>
 #include <detours.h>
+#include <ppl.h>
+#include <tchar.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string>
+#include <vector>
 #include "util.h"
 #include "proxy.h"
+
+class Renderer {
+public:
+    enum FontSize { Small, SmallBold, SmallComic, Medium, Large };
+
+    Renderer(void) : m_iBufferWidth(0), m_iBufferHeight(0), m_bLimitFPS(true) {};
+    virtual ~Renderer(void) {};
+
+    virtual HRESULT Init(HWND hWnd, bool bLimitFPS) = 0;
+    virtual HRESULT ResetDeviceIfNeeded() = 0;
+    virtual HRESULT ResetDevice() = 0;
+    virtual HRESULT Clear(DWORD color) = 0;
+    virtual HRESULT BeginScene() = 0;
+    virtual HRESULT EndScene() = 0;
+    virtual HRESULT Present() = 0;
+    virtual HRESULT BeginText() = 0;
+    virtual HRESULT DrawTextW(const WCHAR* sText, FontSize fsFont, LPRECT rcPos, DWORD dwFormat, DWORD dwColor, INT iChars = -1) = 0;
+    virtual HRESULT DrawTextA(const CHAR* sText, FontSize fsFont, LPRECT rcPos, DWORD dwFormat, DWORD dwColor, INT iChars = -1) = 0;
+    virtual HRESULT EndText() = 0;
+    virtual HRESULT DrawRect(float x, float y, float cx, float cy, DWORD color) = 0;
+    virtual HRESULT DrawRect(float x, float y, float cx, float cy,
+        DWORD c1, DWORD c2, DWORD c3, DWORD c4) = 0;
+    virtual HRESULT DrawSkew(float x1, float y1, float x2, float y2, float x3, float y3, float x4, float y4, DWORD color) = 0;
+    virtual HRESULT DrawSkew(float x1, float y1, float x2, float y2, float x3, float y3, float x4, float y4,
+        DWORD c1, DWORD c2, DWORD c3, DWORD c4) = 0;
+
+    bool GetLimitFPS() const { return m_bLimitFPS; }
+    HRESULT SetLimitFPS(bool bLimitFPS);
+
+    int GetBufferWidth() const { return m_iBufferWidth; }
+    int GetBufferHeight() const { return m_iBufferHeight; }
+
+protected:
+    int m_iBufferWidth, m_iBufferHeight;
+    bool m_bLimitFPS;
+};
+
+struct MainScreen {
+    char m_pad0[0x10];
+    Renderer* m_pRenderer;
+};
 
 namespace MIDI {
     int Parse32Bit(const unsigned char* pcData, int iMaxSize, int* piOut) {
@@ -58,15 +104,61 @@ int __fastcall MIDITrack__ParseTrackHook(void* thisptr, unsigned char* pcData, i
     return iTotal + iTrkSize;
 }
 
+int playedNotes = 0;
+
+void (__fastcall* MainScreen__RenderStatus)(MainScreen*, LPRECT) = nullptr;
+void __fastcall MainScreen__RenderStatusHook(MainScreen* thisptr, LPRECT prcStatus) {
+    TCHAR sNotesCount[128];
+    _stprintf_s(sNotesCount, TEXT("%d"), playedNotes);
+
+    RECT customRect;
+    CopyRect(&customRect, prcStatus);
+
+    OffsetRect(&customRect, 8, 56 + 1);
+    thisptr->m_pRenderer->DrawText(TEXT("Played Notes:"), Renderer::Small, &customRect, 0, 0xFF404040);
+    thisptr->m_pRenderer->DrawText(sNotesCount, Renderer::Small, &customRect, DT_RIGHT, 0xFF404040);
+    OffsetRect(&customRect, -2, -1);
+    thisptr->m_pRenderer->DrawText(TEXT("Played Notes:"), Renderer::Small, &customRect, 0, 0xFFFFFFFF);
+    thisptr->m_pRenderer->DrawText(sNotesCount, Renderer::Small, &customRect, DT_RIGHT, 0xFFFFFFFF);
+
+    MainScreen__RenderStatus(thisptr, prcStatus);
+}
+
+MMRESULT (__stdcall* o_midiOutShortMsg)(HMIDIOUT, DWORD) = midiOutShortMsg;
+MMRESULT __stdcall midiOutShortMsgHook(HMIDIOUT hmo, DWORD dwMsg) {
+    MMRESULT result = o_midiOutShortMsg(hmo, dwMsg);
+
+    BYTE bStatus = dwMsg & 0xff;
+    if ((bStatus & 0x80) == 0x80 || (bStatus & 0x90) == 0x90) {
+        playedNotes++;
+    }
+
+    return result;
+}
+
 void WINAPI Main() {
-    util::InitConsole();
+    //util::InitConsole();
 
     MIDITrack__clear = decltype(MIDITrack__clear)(util::GetBaseAddress() + 0x2B8B0);
     MIDITrack__ParseEvents = decltype(MIDITrack__ParseEvents)(util::GetBaseAddress() + 0x2BA50);
     MIDITrack__ParseTrack = decltype(MIDITrack__ParseEvents)(util::GetBaseAddress() + 0x2B990);
+    //MIDI__ConnectNotes = decltype(MIDI__ConnectNotes)(util::GetBaseAddress() + 0x2B6B0);
+    MainScreen__RenderStatus = decltype(MainScreen__RenderStatus)(util::GetBaseAddress() + 0x1FEA0);
 
     DetourTransactionBegin();
     DetourAttach(&(PVOID&)MIDITrack__ParseTrack, MIDITrack__ParseTrackHook);
+    DetourTransactionCommit();
+
+    //DetourTransactionBegin();
+    //DetourAttach(&(PVOID&)MIDI__ConnectNotes, MIDI__ConnectNotesHook);
+    //DetourTransactionCommit();
+
+    DetourTransactionBegin();
+    DetourAttach(&(PVOID&)MainScreen__RenderStatus, MainScreen__RenderStatusHook);
+    DetourTransactionCommit();
+
+    DetourTransactionBegin();
+    DetourAttach(&(PVOID&)o_midiOutShortMsg, midiOutShortMsgHook);
     DetourTransactionCommit();
 }
 
